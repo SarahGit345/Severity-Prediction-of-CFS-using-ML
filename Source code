@@ -1,0 +1,187 @@
+#Source Code
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
+from sklearn.decomposition import PCA
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix, roc_curve, auc
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+from matplotlib.colors import ListedColormap
+import warnings
+warnings.filterwarnings("ignore")
+
+# STEP 1: Load and clean dataset
+balanced_df = pd.read_csv("/content/balanced_cfs_dataset.csv")
+balanced_df = balanced_df[~balanced_df['cgi_cfsme'].isna()]
+
+# STEP 2: Prepare baseline-only features and labels
+X = balanced_df.drop(columns=['cgi_cfsme'])
+baseline_cols = [col for col in X.columns if col.endswith('_0') or ('_0' not in col and '_1' not in col)]
+X = X[baseline_cols]
+X = X.select_dtypes(include=[np.number])
+y = LabelEncoder().fit_transform(balanced_df['cgi_cfsme'])
+class_names = np.unique(balanced_df['cgi_cfsme'])
+y = y[:len(X)]
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# STEP 3: Build cosine graph
+def build_cosine_graph(X_scaled, threshold=0.88):
+    cos_sim = cosine_similarity(X_scaled)
+    np.fill_diagonal(cos_sim, 0)
+    edge_list = np.array(np.where(cos_sim > threshold))
+    edge_index = torch.tensor(edge_list, dtype=torch.long)
+    return edge_index
+
+X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.long)
+edge_index = build_cosine_graph(X_scaled)
+data = Data(x=X_tensor, y=y_tensor, edge_index=edge_index)
+
+# STEP 4: Define GCN
+class SimpleGCN(nn.Module):
+    def __init__(self, input_dim):
+        super(SimpleGCN, self).__init__()
+        self.conv1 = GCNConv(input_dim, 640)
+        self.bn1 = nn.BatchNorm1d(640)
+        self.conv2 = GCNConv(640, 512)
+        self.bn2 = nn.BatchNorm1d(512)
+        self.conv3 = GCNConv(512, 384)
+        self.bn3 = nn.BatchNorm1d(384)
+        self.conv4 = GCNConv(384, 256)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = F.relu(self.bn1(self.conv1(x, edge_index)))
+        x = self.dropout(x)
+        x = F.relu(self.bn2(self.conv2(x, edge_index)))
+        x = self.dropout(x)
+        x = F.relu(self.bn3(self.conv3(x, edge_index)))
+        x = self.conv4(x, edge_index)
+        return x
+
+# STEP 5: Train GCN
+model = SimpleGCN(input_dim=X_tensor.shape[1]).to(torch.device('cpu'))
+data = data.to(torch.device('cpu'))
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+model.train()
+for epoch in range(700):
+    optimizer.zero_grad()
+    out = model(data)
+    loss = F.cross_entropy(out, data.y)
+    loss.backward()
+    optimizer.step()
+    if epoch % 100 == 0:
+        print(f"Epoch {epoch} | Loss: {loss.item():.4f}")
+
+# STEP 6: GCN Embeddings and PCA Visualization
+model.eval()
+with torch.no_grad():
+    gcn_embeddings = model(data).cpu().numpy()
+
+pca = PCA(n_components=2)
+gcn_pca = pca.fit_transform(gcn_embeddings)
+plt.figure(figsize=(8, 6))
+sns.scatterplot(x=gcn_pca[:, 0], y=gcn_pca[:, 1], hue=balanced_df['cgi_cfsme'][:len(gcn_pca)], palette='tab10')
+plt.title("2D PCA of GCN Embeddings")
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
+plt.legend(title="Class")
+plt.tight_layout()
+plt.show()
+
+# STEP 7: Combine embeddings and features
+X_combined = np.concatenate([X_scaled, gcn_embeddings], axis=1)
+X_train, X_test, y_train, y_test = train_test_split(X_combined, y, test_size=0.20, random_state=42, stratify=y)
+
+# STEP 8: Train XGBoost
+params = {
+    'objective': 'multi:softprob',
+    'eval_metric': 'mlogloss',
+    'num_class': len(class_names),
+    'learning_rate': 0.012,
+    'max_depth': 12,
+    'subsample': 0.97,
+    'colsample_bytree': 0.98,
+    'gamma': 0.1,
+    'min_child_weight': 1,
+    'reg_alpha': 0.02,
+    'reg_lambda': 0.4
+}
+dtrain = xgb.DMatrix(X_train, label=y_train)
+dtest = xgb.DMatrix(X_test, label=y_test)
+bst = xgb.train(params, dtrain, num_boost_round=2000, early_stopping_rounds=100, evals=[(dtest, 'eval')], verbose_eval=100)
+
+# STEP 9: Evaluate
+y_pred_probs = bst.predict(dtest)
+y_pred = np.argmax(y_pred_probs, axis=1)
+print("\n📊 Evaluation Metrics:")
+print(f"✅ Accuracy : {accuracy_score(y_test, y_pred):.4f}")
+print(f"✅ Precision: {precision_score(y_test, y_pred, average='weighted'):.4f}")
+print(f"✅ Recall   : {recall_score(y_test, y_pred, average='weighted'):.4f}")
+print(f"✅ F1 Score : {f1_score(y_test, y_pred, average='weighted'):.4f}")
+print("\nClassification Report:\n", classification_report(y_test, y_pred, target_names=class_names))
+
+# STEP 10: Confusion Matrix
+plt.figure(figsize=(10, 6))
+cm = confusion_matrix(y_test, y_pred)
+sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+plt.title("Confusion Matrix (Test Set)")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+# STEP 11: ROC Curve
+y_test_bin = label_binarize(y_test, classes=np.arange(len(class_names)))
+fpr, tpr, roc_auc = {}, {}, {}
+for i in range(len(class_names)):
+    fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_pred_probs[:, i])
+    roc_auc[i] = auc(fpr[i], tpr[i])
+
+fpr["micro"], tpr["micro"], _ = roc_curve(y_test_bin.ravel(), y_pred_probs.ravel())
+roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+
+all_fpr = np.unique(np.concatenate([fpr[i] for i in range(len(class_names))]))
+mean_tpr = np.zeros_like(all_fpr)
+for i in range(len(class_names)):
+    mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+mean_tpr /= len(class_names)
+fpr["macro"], tpr["macro"] = all_fpr, mean_tpr
+roc_auc["macro"] = auc(all_fpr, mean_tpr)
+
+plt.figure(figsize=(12, 8))
+custom_cmap = ListedColormap(sns.color_palette("husl", len(class_names)))
+for i, color in zip(range(len(class_names)), custom_cmap.colors):
+    plt.plot(fpr[i], tpr[i], lw=2, label=f"{class_names[i]} (AUC = {roc_auc[i]:.2f})", color=color)
+
+plt.plot(fpr["micro"], tpr["micro"], linestyle=':', color='black', lw=2, label=f"Micro-average (AUC = {roc_auc['micro']:.2f})")
+plt.plot(fpr["macro"], tpr["macro"], linestyle=':', color='red', lw=2, label=f"Macro-average (AUC = {roc_auc['macro']:.2f})")
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("Multiclass ROC Curves")
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+print("\n🔍 AUC Scores by Class:")
+for i, name in enumerate(class_names):
+    print(f"{name}: AUC = {roc_auc[i]:.4f}")
+print(f"Micro-average AUC: {roc_auc['micro']:.4f}")
+print(f"Macro-average AUC: {roc_auc['macro']:.4f}")
+
+# STEP 12: Feature Importance
+xgb.plot_importance(bst, max_num_features=20, height=0.5, importance_type='gain', title="Top 20 Feature Importances")
+plt.tight_layout()
+plt.show()
