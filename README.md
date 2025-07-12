@@ -1,1 +1,1 @@
-# Severity-Prediction-of-CFS-using-ML
+Chronic Fatigue Syndrome (CFS), also known as Myalgic Encephalomyelitis (ME), affects millions of individuals worldwide. Accurate severity detection can play a crucial role in improving patients’ quality of life. This project explores machine learning approaches for detecting the severity of CFS based on patient-reported symptoms and clinical data.
